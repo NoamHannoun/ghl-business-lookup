@@ -7,11 +7,27 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 
 const BASE = 'https://search.sunbiz.org';
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  Accept: 'text/html,application/xhtml+xml',
-  'Accept-Language': 'en-US,en;q=0.9',
-};
+
+// Route requests through ScrapingBee to bypass Sunbiz bot protection
+async function fetchUrl(url) {
+  const apiKey = process.env.SCRAPINGBEE_API_KEY;
+  if (apiKey) {
+    const res = await axios.get('https://app.scrapingbee.com/api/v1/', {
+      params: { api_key: apiKey, url, render_js: false },
+      timeout: 30000,
+    });
+    return res.data;
+  }
+  // Fallback: direct request (may 403 on server)
+  const res = await axios.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      Accept: 'text/html,application/xhtml+xml',
+    },
+    timeout: 15000,
+  });
+  return res.data;
+}
 
 async function lookupFL(companyName) {
   try {
@@ -30,25 +46,23 @@ async function lookupFL(companyName) {
 }
 
 async function searchForEntity(companyName) {
-  const res = await axios.get(`${BASE}/Inquiry/CorporationSearch/SearchResults`, {
-    params: {
-      inquiryType: 'EntityName',
-      inquiryDirectionType: 'ForwardList',
-      searchNameOrder: '',
-      masterDatatoTransferCode: '',
-      EntityName: companyName,
-      fileNumber: '',
-      directorName: '',
-      raName: '',
-      omni: '',
-      searchTerm: 'EntityName',
-      listNameOrder: '',
-    },
-    headers: HEADERS,
-    timeout: 15000,
+  const params = new URLSearchParams({
+    inquiryType: 'EntityName',
+    inquiryDirectionType: 'ForwardList',
+    searchNameOrder: '',
+    masterDatatoTransferCode: '',
+    EntityName: companyName,
+    fileNumber: '',
+    directorName: '',
+    raName: '',
+    omni: '',
+    searchTerm: 'EntityName',
+    listNameOrder: '',
   });
+  const searchUrl = `${BASE}/Inquiry/CorporationSearch/SearchResults?${params.toString()}`;
+  const html = await fetchUrl(searchUrl);
 
-  const $ = cheerio.load(res.data);
+  const $ = cheerio.load(html);
   let href = null;
 
   // Search results table — find first Active row
@@ -76,8 +90,7 @@ async function searchForEntity(companyName) {
 }
 
 async function fetchPage(url) {
-  const res = await axios.get(url, { headers: HEADERS, timeout: 15000 });
-  return res.data;
+  return fetchUrl(url);
 }
 
 function parseOwner(html, companyName) {
