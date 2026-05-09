@@ -9,19 +9,20 @@ const cheerio = require('cheerio');
 const BASE = 'https://search.sunbiz.org';
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  Accept: 'text/html,application/xhtml+xml',
   'Accept-Language': 'en-US,en;q=0.9',
 };
-
-// Roles we consider "owners" — ordered by preference
-const OWNER_ROLES = ['mgr', 'mgrm', 'authorized member', 'member', 'president', 'p', 'director', 'pa', 'vp'];
 
 async function lookupFL(companyName) {
   try {
     const detailUrl = await searchForEntity(companyName);
-    if (!detailUrl) return null;
+    if (!detailUrl) {
+      console.log(`[sunbiz] no search result for: ${companyName}`);
+      return null;
+    }
+    console.log(`[sunbiz] fetching detail: ${detailUrl}`);
     const html = await fetchPage(detailUrl);
-    return parseOwner(html);
+    return parseOwner(html, companyName);
   } catch (err) {
     console.error(`[sunbiz] error: ${err.message}`);
     return null;
@@ -50,19 +51,26 @@ async function searchForEntity(companyName) {
   const $ = cheerio.load(res.data);
   let href = null;
 
-  // Prefer the first ACTIVE result; fall back to first result overall
-  $('table.search-results tbody tr, table tbody tr').each((_, row) => {
+  // Search results table — find first Active row
+  $('table tr').each((_, row) => {
+    if (href) return;
     const cells = $(row).find('td');
-    if (cells.length < 5) return;
-    const link = $(row).find('a[href*="SearchResultDetail"]').first();
-    if (!link.length) return;
-    const status = cells.eq(4).text().trim().toUpperCase();
-    if (!href) href = link.attr('href');          // first result fallback
-    if (status === 'ACTIVE') { href = link.attr('href'); return false; } // stop on first active
-  });
+    if (cells.length < 3) return;
 
-  // Broader fallback if table structure differs
-  if (!href) href = $('a[href*="SearchResultDetail"]').first().attr('href');
+    const link = $(cells[0]).find('a').first();
+    if (!link.length) return;
+
+    // Check status column (last cell)
+    const status = $(cells[cells.length - 1]).text().trim().toUpperCase();
+    const rowHref = link.attr('href');
+
+    // Prefer Active, but grab first result as fallback
+    if (!href) href = rowHref;
+    if (status === 'ACTIVE') {
+      href = rowHref;
+      return false; // break
+    }
+  });
 
   return href ? `${BASE}${href}` : null;
 }
@@ -72,110 +80,149 @@ async function fetchPage(url) {
   return res.data;
 }
 
-function parseOwner(html) {
+function parseOwner(html, companyName) {
   const $ = cheerio.load(html);
 
-  // Strategy 1: structured detailSection divs (most common Sunbiz layout)
-  const people = [];
+  console.log(`[sunbiz] parsing detail page, html length: ${html.length}`);
+
+  // Strategy 1: Find Authorized Person / Officer / Manager sections
+  // Sunbiz uses <div class="detailSection"> with <span class="title"> headers
+  const ownerKeywords = ['authorized person', 'officer', 'director', 'manager', 'member'];
+  const skipKeywords  = ['registered agent', 'principal address', 'mailing address'];
+
+  let people = [];
 
   $('div.detailSection').each((_, section) => {
-    const headerText = $(section).find('span.title').first().text().toLowerCase();
+    const title = $(section).find('span.title').first().text().toLowerCase().trim();
+    const isOwner = ownerKeywords.some(k => title.includes(k));
+    const isSkip  = skipKeywords.some(k => title.includes(k));
 
-    const isOwnerSection =
-      headerText.includes('officer') ||
-      headerText.includes('director') ||
-      headerText.includes('authorized person') ||
-      headerText.includes('manager') ||
-      headerText.includes('member');
+    if (!isOwner || isSkip) return;
+    console.log(`[sunbiz] found owner section: "${title}"`);
 
-    const isSkipSection =
-      headerText.includes('registered agent') ||
-      headerText.includes('annual report');
-
-    if (!isOwnerSection || isSkipSection) return;
-
-    // Each person occupies a pair of .col divs: [name+address] [title]
-    const rows = $(section).find('div.row').toArray();
-    for (const row of rows) {
-      const cols = $(row).find('div.col').toArray();
-      if (cols.length < 2) continue;
+    // Each person block: two .col divs — [name+address] [title]
+    $(section).find('div.row').each((_, row) => {
+      const cols = $(row).find('div.col');
+      if (cols.length < 1) return;
 
       const nameBlock = $(cols[0]).html() || '';
-      const titleText = $(cols[1]).text().trim();
+      const roleText  = cols.length > 1 ? $(cols[1]).text().trim() : '';
 
-      // Split on <br> tags to get individual lines
       const lines = nameBlock
         .split(/<br\s*\/?>/i)
         .map(l => cheerio.load(l).text().trim())
-        .filter(Boolean);
+        .filter(l => l && !l.toLowerCase().includes('name & address'));
 
-      if (!lines.length || lines[0].toLowerCase().includes('name & address')) continue;
+      if (!lines.length) return;
 
-      const raw = lines[0];
-      const { firstName, lastName } = splitName(raw);
-      const address = parseAddressLines(lines.slice(1));
+      const { firstName, lastName } = splitName(lines[0]);
+      const addr = parseAddressLines(lines.slice(1));
+      people.push({ firstName, lastName, role: roleText, ...addr });
+    });
+  });
 
-      people.push({ firstName, lastName, title: titleText, ...address });
+  if (people.length > 0) {
+    console.log(`[sunbiz] found ${people.length} people in owner sections`);
+    return selectBest(people);
+  }
+
+  // Strategy 2: Registered Agent as fallback owner
+  // For small LLCs the agent is often the owner
+  $('div.detailSection').each((_, section) => {
+    const title = $(section).find('span.title').first().text().toLowerCase().trim();
+    if (!title.includes('registered agent')) return;
+
+    const lines = $(section).text()
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l && !l.toLowerCase().includes('registered agent') && !l.toLowerCase().includes('name & address'));
+
+    if (lines.length > 0) {
+      const { firstName, lastName } = splitName(lines[0]);
+      const addr = parseAddressLines(lines.slice(1));
+      console.log(`[sunbiz] using registered agent as owner: ${lines[0]}`);
+      people.push({ firstName, lastName, role: 'RA', ...addr });
     }
   });
 
   if (people.length > 0) return selectBest(people);
 
-  // Strategy 2: regex fallback on raw page text
-  return regexFallback($.text());
+  // Strategy 3: Pure text regex fallback
+  return regexFallback($.text(), companyName);
 }
 
-function regexFallback(text) {
-  // Look for a name followed by an address block near owner-role keywords
-  const pattern =
-    /(?:Manager|President|Director|Authorized Member|Member)\s*\n\s*([A-Z][A-Z\s'-]+?)\s*\n\s*(\d+[^\n]+)\n\s*([A-Za-z][^,\n]+),?\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/gi;
+function regexFallback(text, companyName) {
+  console.log('[sunbiz] trying regex fallback');
 
+  // Look for ALL-CAPS name followed by address near ownership keywords
+  const pattern = /(?:Manager|President|Director|Authorized|Member|Agent)[^\n]{0,50}\n\s*([A-Z][A-Z\s'-]{2,40})\n\s*(\d+[^\n]+)\n\s*([A-Za-z][^,\n]+),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/g;
   const match = pattern.exec(text);
-  if (!match) return null;
 
-  const [, rawName, address, city, state, zip] = match;
-  const { firstName, lastName } = splitName(rawName.trim());
-  return { firstName, lastName, address: address.trim(), city: city.trim(), state, zip };
-}
-
-function selectBest(people) {
-  for (const role of OWNER_ROLES) {
-    const match = people.find(p => (p.title || '').toLowerCase().includes(role));
-    if (match) return match;
+  if (match) {
+    const { firstName, lastName } = splitName(match[1].trim());
+    return {
+      firstName, lastName,
+      address: match[2].trim(),
+      city: match[3].trim(),
+      state: match[4],
+      zip: match[5],
+    };
   }
-  return people[0];
+
+  // Last resort: find any ALL-CAPS line that looks like a person name near an address
+  const namePattern = /\n([A-Z]+(?:\s+[A-Z]+){1,3})\n(\d+[^\n]+)\n([A-Za-z][^,\n]+),?\s+([A-Z]{2})\s+(\d{5})/g;
+  const nm = namePattern.exec(text);
+  if (nm) {
+    const { firstName, lastName } = splitName(nm[1].trim());
+    return {
+      firstName, lastName,
+      address: nm[2].trim(),
+      city: nm[3].trim(),
+      state: nm[4],
+      zip: nm[5],
+    };
+  }
+
+  console.log('[sunbiz] regex fallback found nothing');
+  return null;
 }
 
 function parseAddressLines(lines) {
   if (!lines.length) return {};
   const address = lines[0] || '';
-
-  // "MIAMI, FL 33101" or "MIAMI FL 33101"
   const last = lines[lines.length - 1] || '';
-  const m = last.match(/^([A-Za-z\s]+?),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
-  if (m) {
-    return { address, city: m[1].trim(), state: m[2], zip: m[3] };
-  }
 
-  // Sometimes city and zip are on separate lines
+  // "CITY, ST 12345" or "CITY ST 12345"
+  const m = last.match(/^([A-Za-z\s]+?),?\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$/);
+  if (m) return { address, city: m[1].trim(), state: m[2], zip: m[3] };
+
+  // City and state/zip on separate lines
   if (lines.length >= 3) {
-    const cityLine = lines[lines.length - 2];
-    const stateZip = lines[lines.length - 1].match(/([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
-    if (stateZip) {
-      return { address, city: cityLine.trim(), state: stateZip[1], zip: stateZip[2] };
-    }
+    const sz = lines[lines.length - 1].match(/([A-Z]{2})\s+(\d{5}(?:-\d{4})?)/);
+    if (sz) return { address, city: lines[lines.length - 2].trim(), state: sz[1], zip: sz[2] };
   }
 
   return { address };
 }
 
-function splitName(raw) {
-  const name = raw.replace(/\s+/g, ' ').trim();
+const ROLE_PRIORITY = ['mgr', 'mgrm', 'authorized member', 'member', 'president', 'p', 'director'];
 
-  // "DOE, JOHN MICHAEL" format
+function selectBest(people) {
+  for (const role of ROLE_PRIORITY) {
+    const match = people.find(p => (p.role || '').toLowerCase().includes(role));
+    if (match) return match;
+  }
+  return people[0];
+}
+
+function splitName(raw) {
+  const name = (raw || '').replace(/\s+/g, ' ').trim();
+  if (!name) return { firstName: '', lastName: '' };
+
+  // "LAST, FIRST" format
   if (name.includes(',')) {
-    const [last, rest] = name.split(',').map(s => s.trim());
-    return { firstName: toTitle(rest), lastName: toTitle(last) };
+    const [last, ...rest] = name.split(',').map(s => s.trim());
+    return { firstName: toTitle(rest.join(' ')), lastName: toTitle(last) };
   }
 
   const parts = name.split(' ');
@@ -185,9 +232,7 @@ function splitName(raw) {
 }
 
 function toTitle(str) {
-  return str
-    .toLowerCase()
-    .replace(/\b\w/g, c => c.toUpperCase());
+  return str.toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
 }
 
 module.exports = { lookupFL };
