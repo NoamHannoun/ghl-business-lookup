@@ -1,0 +1,15 @@
+{
+  "name": "ghl-business-lookup",
+  "version": "1.0.0",
+  "description": "Webhook service to look up holding company owners via FL Sunbiz and OpenCorporates",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cheerio": "^1.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0"
+  }
+}
