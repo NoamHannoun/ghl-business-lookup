@@ -27,17 +27,10 @@ app.post('/lookup', async (req, res) => {
     let ownerData = null;
     const state = (mailing_state || '').toUpperCase().replace(/\./g, '').trim();
 
-    // FL: hit Sunbiz first (authoritative, free, no rate limits)
-    if (state === 'FL' || state === 'FLORIDA') {
-      ownerData = await lookupFL(company_name);
-      if (ownerData) console.log(`[sunbiz] found: ${ownerData.firstName} ${ownerData.lastName}`);
-    }
-
-    // Fallback: OpenCorporates (covers all states, needs free trial token)
-    if (!ownerData) {
-      ownerData = await lookupOpenCorporates(company_name, state || 'FL');
-      if (ownerData) console.log(`[opencorporates] found: ${ownerData.firstName} ${ownerData.lastName}`);
-    }
+    // Always try Sunbiz first — many holding companies incorporate in FL
+    // regardless of where their mailing address is
+    ownerData = await lookupFL(company_name);
+    if (ownerData) console.log(`[sunbiz] found: ${ownerData.firstName} ${ownerData.lastName}`);
 
     if (!ownerData) {
       console.log(`[lookup] no owner found for: ${company_name}`);
